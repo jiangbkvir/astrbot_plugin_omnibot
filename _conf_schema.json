@@ -1,0 +1,75 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后不再转发 QQ 消息；已开放的回调接口返回 503。"
+  },
+  "outbound_gateway_enabled": {
+    "description": "开放 OmniBot 回调接口",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭。普通 QQ 指令由 OmniBot webhook 的 reply 同步返回，不需要反向访问 AstrBot。只有 OmniBot 需要站内信、后台通知等主动推送时才开启。开启后务必设置高强度密钥，且不要把端口直接暴露公网。"
+  },
+  "omnibot_site_url": {
+    "description": "OmniBot 站点地址",
+    "type": "string",
+    "default": "http://127.0.0.1:8004",
+    "hint": "NexusPHP 站点根地址，不带结尾斜杠。插件会把 QQ 消息 POST 到 {地址}/api/omnibot/qq/webhook。站点在 Docker 里时，本机填 http://host.docker.internal:8004；AstrBot 也在容器里则填容器能访问到的地址。"
+  },
+  "qq_bot_secret": {
+    "description": "QQ 安全密钥",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "必须与 OmniBot 后台的「QQ 安全密钥」完全一致。入站时写入 webhook 的 _secret 字段，出站时校验 X-API-Key 请求头。留空时网关和消息转发都会拒绝（fail-closed）。"
+  },
+  "gateway_host": {
+    "description": "OmniBot 网关监听地址",
+    "type": "string",
+    "default": "127.0.0.1",
+    "hint": "仅在开启「开放 OmniBot 回调接口」时生效。优先填 127.0.0.1；OmniBot 在别的容器时填内网地址，不要直接暴露公网。"
+  },
+  "gateway_port": {
+    "description": "OmniBot 网关端口",
+    "type": "int",
+    "default": 8080,
+    "hint": "仅在开启回调接口时生效。OmniBot 的「QQ 服务地址」默认是 http://127.0.0.1:8080。端口被占用时改成别的，并同步修改 OmniBot 的「QQ 服务地址」。"
+  },
+  "allowed_groups": {
+    "description": "允许转发的群号",
+    "type": "list",
+    "default": [],
+    "hint": "只转发这些 QQ 群的消息。留空表示全部转发，由 OmniBot 后台的群白名单决定。"
+  },
+  "forward_private": {
+    "description": "转发私聊消息",
+    "type": "bool",
+    "default": true,
+    "hint": "是否把 QQ 私聊消息也转发给 OmniBot（绑定账号等操作通常在私聊进行）。"
+  },
+  "request_timeout": {
+    "description": "请求超时（秒）",
+    "type": "int",
+    "default": 10,
+    "hint": "向 OmniBot webhook 发请求的超时时间。OmniBot 侧是 5 秒，这里别设太小。"
+  },
+  "stop_event_after_forward": {
+    "description": "转发后阻止 AstrBot 继续处理",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，已转发成功的消息不会再触发 AstrBot 的 AI 回复和其他插件，避免同一条消息被回复两次。"
+  },
+  "reply_from_webhook_json": {
+    "description": "直接使用 webhook 响应的回复",
+    "type": "bool",
+    "default": true,
+    "hint": "OmniBot 的 QQ webhook 会在响应体返回 {\"reply\": \"...\"}。开启时插件直接把它发到 QQ，响应更快；关闭时只依赖 OmniBot 通过 /api/send_* 主动推送。"
+  },
+  "reply_prefix": {
+    "description": "回复前缀",
+    "type": "string",
+    "default": "",
+    "hint": "给插件代发的回复统一加一个前缀。留空不加。"
+  }
+}

@@ -1,0 +1,10 @@
+name: astrbot_plugin_omnibot
+display_name: OmniBot QQ 网关
+short_desc: 把 AstrBot 接成 OmniBot 的 QQ 机器人传输网关。
+desc: 在 AstrBot 内实现 OmniBot 的 QQ HTTP 网关契约，双向桥接 QQ 群/私聊与 NexusPHP OmniBot，无需修改 OmniBot。插件只负责消息传输、CQ 码转换、回复代发和 X-API-Key/_secret 鉴权，不实现签到、绑定、转账等业务；业务全部由 OmniBot 处理。支持 aiocqhttp 和 qq_official。
+author: tangpt
+version: 1.0.1
+support_platforms:
+  - aiocqhttp
+  - qq_official
+astrbot_version: ">=4.18,<5"
