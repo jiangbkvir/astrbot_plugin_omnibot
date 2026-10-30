@@ -5,11 +5,29 @@
     "default": true,
     "hint": "关闭后不再转发 QQ 消息；已开放的回调接口返回 503。"
   },
+  "message_parser": {
+    "description": "QQ 消息解析模式",
+    "type": "string",
+    "default": "auto",
+    "hint": "可选 auto、onebot、qq_official。auto 会根据 AstrBot 平台自动判断；NapCat、LLOneBot、Lagrange 统一选择 onebot（也兼容 aiocqhttp/onebot_v11/napcat/llonebot/lagrange 别名）；QQ 官方机器人选择 qq_official。"
+  },
   "outbound_gateway_enabled": {
     "description": "开放 OmniBot 回调接口",
     "type": "bool",
     "default": false,
     "hint": "默认关闭。普通 QQ 指令由 OmniBot webhook 的 reply 同步返回，不需要反向访问 AstrBot。只有 OmniBot 需要站内信、后台通知等主动推送时才开启。开启后务必设置高强度密钥，且不要把端口直接暴露公网。"
+  },
+  "guess_result_watch_enabled": {
+    "description": "接收猜大小开奖结果",
+    "type": "bool",
+    "default": true,
+    "hint": "下注成功后，OmniBot 会在 webhook 回复中返回当前群或私聊的监听目标。AstrBot 只在该目标尚未开奖时按服务端给出的时间查询，结果送达、无人参与或超过截止时间后立即停止。"
+  },
+  "guess_result_watch_retry_seconds": {
+    "description": "猜大小结果复查间隔",
+    "type": "int",
+    "default": 10,
+    "hint": "正常不会持续轮询。仅当已经到预计开奖时间但结果尚未生成，或消息暂时发送失败时，才按此间隔复查；最小 3 秒，最大 60 秒。"
   },
   "omnibot_site_url": {
     "description": "OmniBot 站点地址",
@@ -42,6 +60,60 @@
     "default": [],
     "hint": "只转发这些 QQ 群的消息。留空表示全部转发，由 OmniBot 后台的群白名单决定。"
   },
+  "qq_group_id_map": {
+    "description": "QQ 官方群 openid 到数字群号映射",
+    "type": "dict",
+    "default": {},
+    "hint": "QQ 官方消息只提供 group_openid，OmniBot 后台又使用数字群号时在这里映射。格式为 {openid: 数字群号}；插件转发时把 group_id 换成数字群号，并保留 group_openid，主动推送时也会自动映射回去。"
+  },
+  "command_panel_sync_enabled": {
+    "description": "同步 QQ 官方指令面板",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，插件会定时从 OmniBot 拉取当前启用的 QQ 指令，并使用 AstrBot 的 QQ 官方 AppID/AppSecret 自动创建或更新群指令面板。"
+  },
+  "command_panel_fallback_enabled": {
+    "description": "指令清单不可用时使用内置菜单",
+    "type": "bool",
+    "default": true,
+    "hint": "OmniBot 的 /api/omnibot/qq/commands 接口未部署或暂时不可用时，使用插件内置的常用指令清单注册 QQ 面板；接口恢复后会自动切换为 OmniBot 动态清单。"
+  },
+  "command_panel_sync_interval": {
+    "description": "指令面板同步间隔（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "最小 30 秒。后台修改指令开关、描述或别名后，插件会在下个同步周期自动更新 QQ 面板。"
+  },
+  "command_panel_target_type": {
+    "description": "指令面板作用范围",
+    "type": "string",
+    "default": "all",
+    "hint": "all=机器人加入的该场景全部群都显示；specific=只显示在下方配置的群。QQ 群面板需要 group_openid，不能直接填写数字群号。"
+  },
+  "command_panel_group_ids": {
+    "description": "指令面板指定群",
+    "type": "list",
+    "default": [],
+    "hint": "仅 command_panel_target_type=specific 时生效。可填写 group_openid，或填写 qq_group_id_map 中的数字群号；插件会自动反查 openid。留空时使用 qq_group_id_map 的全部群。"
+  },
+  "command_panel_platform_id": {
+    "description": "指定 QQ 官方平台 ID",
+    "type": "string",
+    "default": "",
+    "hint": "AstrBot 配置了多个 qq_official 机器人时，填写对应平台 ID；留空使用第一个已启用的 QQ 官方平台。"
+  },
+  "command_panel_remark": {
+    "description": "指令面板内部备注",
+    "type": "string",
+    "default": "OmniBot 自动同步指令面板",
+    "hint": "用于识别由 OmniBot 创建的 QQ 指令面板，不会展示给群成员。修改后会创建新面板，不建议随意更改。"
+  },
+  "command_panel_max_items": {
+    "description": "指令面板最多展示数量",
+    "type": "int",
+    "default": 20,
+    "hint": "QQ 官方限制单个面板最多 20 个元素，插件会按该值截断。"
+  },
   "forward_private": {
     "description": "转发私聊消息",
     "type": "bool",
@@ -58,7 +130,7 @@
     "description": "转发后阻止 AstrBot 继续处理",
     "type": "bool",
     "default": true,
-    "hint": "开启后，已转发成功的消息不会再触发 AstrBot 的 AI 回复和其他插件，避免同一条消息被回复两次。"
+    "hint": "开启后，只要消息进入 OmniBot 转发流程，无论请求成功、超时还是鉴权失败，都不会再触发 AstrBot 的 AI 回复和其他插件。仅做 OmniBot 转发时无需给 AstrBot 配置大模型。"
   },
   "reply_from_webhook_json": {
     "description": "直接使用 webhook 响应的回复",
@@ -71,5 +143,55 @@
     "type": "string",
     "default": "",
     "hint": "给插件代发的回复统一加一个前缀。留空不加。"
+  },
+  "reply_markdown_enabled": {
+    "description": "把 OmniBot 回复解析为 Markdown",
+    "type": "bool",
+    "default": true,
+    "hint": "OmniBot 回的是 `────` 分隔 + `键：值` 的纯文本模板。开启后插件会重排为 Markdown（标题、表格、列表），并通过 QQ 的 markdown 消息直接发送；如果 OmniBot 已经直接返回 Markdown，则原样透传不再改写。"
+  },
+  "reply_markdown_platforms": {
+    "description": "启用 Markdown 的平台",
+    "type": "list",
+    "default": [
+      "qq_official"
+    ],
+    "hint": "填平台适配器名。QQ 官方支持直接渲染 markdown；OneBot/NapCat 等客户端通常不渲染，填入会导致消息里出现 `##`、`|` 等原始语法，因此默认只给 qq_official。"
+  },
+  "reply_markdown_max_rows": {
+    "description": "表格/列表最多渲染行数",
+    "type": "int",
+    "default": 40,
+    "hint": "表格/列表最多渲染行数，超出部分折叠为一行省略说明，避免消息过长被平台截断。"
+  },
+  "reply_markdown_lottery_max_rows": {
+    "description": "抽奖中奖记录最多显示条数",
+    "type": "int",
+    "default": 5,
+    "hint": "抽奖结果的“中奖汇总”最多显示前几项，其余显示为已折叠；设为 0 可全部折叠。完整记录仍由 OmniBot 发送到站内信。QQ Markdown 不支持点击展开。"
+  },
+  "log_all_messages": {
+    "description": "打印收到的所有消息",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，每条进入网关的 QQ 消息都会原样打到日志（群ID、发送者、纯文本、raw_message、消息链），只观测不影响转发。用来排查消息是否到达、以及 qq_official 的 group_openid 到底是什么值。"
+  },
+  "forward_to_omnibot": {
+    "description": "转发消息到 OmniBot",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后只打印消息，不再 POST 到 OmniBot webhook，也不会上报错误、不会被密钥或白名单拦住。调试消息接收链路时关掉它。"
+  },
+  "log_message_chain": {
+    "description": "打印消息链",
+    "type": "bool",
+    "default": true,
+    "hint": "额外打印解析后的消息段列表，可看到 At、图片等结构化组件。关闭后只打纯文本和 raw_message。"
+  },
+  "max_print_chars": {
+    "description": "单条消息最长打印字符数",
+    "type": "int",
+    "default": 2000,
+    "hint": "超长文本截断到此长度，避免日志被刷爆。"
   }
 }

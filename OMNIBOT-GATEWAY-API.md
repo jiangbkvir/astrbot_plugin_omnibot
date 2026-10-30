@@ -8,15 +8,20 @@
 
 ## AstrBot 平台适配差异
 
-`astrbot_plugin_omnibot` 只做传输，支持 `aiocqhttp` 和 `qq_official`：
+`astrbot_plugin_omnibot` 只做传输，支持 NapCat / LLOneBot / Lagrange
+（AstrBot 的 `aiocqhttp` OneBot v11 适配器）和 `qq_official`：
 
-| 项目 | `aiocqhttp` | `qq_official` |
+| 项目 | `onebot`（NapCat / LLOneBot / Lagrange） | `qq_official` |
 |---|---|---|
 | 群标识 | 数字群号 | `group_openid` 字符串 |
 | 用户标识 | 数字 QQ 号 | `member_openid` / `user_openid` |
 | `raw_message` | 真实消息段重建 CQ 码 | 真实 At 段重建；手打 CQ 码中和 |
 | 普通 `/命令` | 原样转发 | 原样转发 |
 | `@成员 +100` | 原样转发给 OmniBot | 只转发平台真实 At，不做业务适配 |
+
+插件配置 `message_parser=auto` 时按 AstrBot 平台自动识别；也可强制设为
+`onebot` 或 `qq_official`。NapCat、LLOneBot、Lagrange 在 AstrBot 中统一使用
+`aiocqhttp` 平台类型，不需要分别适配。
 
 QQ 官方平台没有数字 QQ，和 OmniBot 当前按数字 QQ 绑定的业务模型不同。
 这是 **OmniBot 业务层与 QQ 官方身份模型之间的差异**，不属于传输网关职责。
