@@ -132,6 +132,12 @@
     "default": true,
     "hint": "开启后，只要消息进入 OmniBot 转发流程，无论请求成功、超时还是鉴权失败，都不会再触发 AstrBot 的 AI 回复和其他插件。仅做 OmniBot 转发时无需给 AstrBot 配置大模型。"
   },
+  "forward_queue_size": {
+    "description": "全局消息队列长度",
+    "type": "int",
+    "default": 200,
+    "hint": "所有群/私聊消息统一排队，由单个 worker 串行转发给 OmniBot，避免人一多就并行刷爆服务器。队列塞满时丢弃最旧的排队消息，以优先响应最新指令。数值越大越不容易丢消息，但排队延迟越高。"
+  },
   "reply_from_webhook_json": {
     "description": "直接使用 webhook 响应的回复",
     "type": "bool",
@@ -143,6 +149,18 @@
     "type": "string",
     "default": "",
     "hint": "给插件代发的回复统一加一个前缀。留空不加。"
+  },
+  "auto_recall_enabled": {
+    "description": "自动撤回插件消息",
+    "type": "bool",
+    "default": true,
+    "hint": "仅撤回本插件刚刚发出的消息，不会撤回用户消息或其他插件消息。OneBot（NapCat、LLOneBot、Lagrange）会按发送接口返回的真实 message_id 调用 delete_msg；QQ 官方机器人会调用群聊/C2C 撤回接口。"
+  },
+  "auto_recall_delay_seconds": {
+    "description": "自动撤回延迟（秒）",
+    "type": "int",
+    "default": 15,
+    "hint": "发送成功后等待多少秒再撤回，默认 15 秒，可设置 5 到 120 秒。平台不支持撤回或接口失败时只记录一次警告，不影响消息发送。"
   },
   "reply_markdown_enabled": {
     "description": "把 OmniBot 回复解析为 Markdown",

@@ -43,6 +43,7 @@ DEFAULT_GATEWAY_PORT = 8080
 MAX_BODY_BYTES = 1024 * 1024
 MIN_SECRET_BYTES = 16
 MARKDOWN_MAX_CHARS = 3500
+DEFAULT_FORWARD_QUEUE_SIZE = 200
 GATEWAY_HANDLER_PRIORITY = 10000
 QQ_TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 QQ_OPENAPI_BASE = "https://api.bot.qq.com"
@@ -50,6 +51,9 @@ DEFAULT_PANEL_SYNC_INTERVAL = 300
 DEFAULT_PANEL_REMARK = "OmniBot 自动同步指令面板"
 MAX_PANEL_ITEMS = 20
 PANEL_SYNC_INITIAL_DELAY = 3
+DEFAULT_AUTO_RECALL_DELAY = 15
+MIN_AUTO_RECALL_DELAY = 5
+MAX_AUTO_RECALL_DELAY = 120
 MESSAGE_PARSER_AUTO = "auto"
 MESSAGE_PARSER_ONEBOT = "onebot"
 MESSAGE_PARSER_QQ_OFFICIAL = "qq_official"
@@ -114,6 +118,26 @@ class QqOpenApiError(RuntimeError):
     def __init__(self, message: str, code: int | None = None) -> None:
         super().__init__(message)
         self.code = code
+
+
+class RecallTarget:
+    """A message sent by this plugin that can be recalled later."""
+
+    __slots__ = ("platform_name", "message_id", "session_id", "scene", "bot")
+
+    def __init__(
+        self,
+        platform_name: str,
+        message_id: str,
+        session_id: str,
+        scene: str,
+        bot: Any = None,
+    ) -> None:
+        self.platform_name = platform_name
+        self.message_id = message_id
+        self.session_id = session_id
+        self.scene = scene
+        self.bot = bot
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -573,6 +597,14 @@ class OmniBotGateway(Star):
         self._guess_watches: dict[int, dict[str, Any]] = {}
         self._guess_watch_task: asyncio.Task | None = None
         self._guess_watch_wakeup = asyncio.Event()
+        self._recall_tasks: set[asyncio.Task] = set()
+        self._recall_warnings: set[str] = set()
+
+        self._forward_queue: asyncio.Queue | None = None
+        self._forward_worker: asyncio.Task | None = None
+        self._forward_queue_size = max(
+            1, _as_int(self.config.get("forward_queue_size"), DEFAULT_FORWARD_QUEUE_SIZE)
+        )
 
         if self.outbound_gateway_enabled:
             try:
@@ -637,6 +669,10 @@ class OmniBotGateway(Star):
         return _as_bool(self.config.get("forward_private"), True)
 
     @property
+    def forward_queue_size(self) -> int:
+        return max(1, self._forward_queue_size)
+
+    @property
     def timeout(self) -> int:
         return max(1, _as_int(self.config.get("request_timeout"), 10))
 
@@ -651,6 +687,18 @@ class OmniBotGateway(Star):
     @property
     def reply_prefix(self) -> str:
         return _as_str(self.config.get("reply_prefix"), "")
+
+    @property
+    def auto_recall_enabled(self) -> bool:
+        return _as_bool(self.config.get("auto_recall_enabled"), True)
+
+    @property
+    def auto_recall_delay_seconds(self) -> int:
+        value = _as_int(
+            self.config.get("auto_recall_delay_seconds"),
+            DEFAULT_AUTO_RECALL_DELAY,
+        )
+        return max(MIN_AUTO_RECALL_DELAY, min(value, MAX_AUTO_RECALL_DELAY))
 
     @property
     def reply_markdown_enabled(self) -> bool:
@@ -807,9 +855,20 @@ class OmniBotGateway(Star):
         elif len(self.secret.encode("utf-8")) < MIN_SECRET_BYTES:
             self.logger.warning("qq_bot_secret 少于 16 字节，建议使用更长的随机密钥。")
         self.logger.info("QQ 消息解析模式：%s", self.message_parser)
+        self._start_forward_worker()
+        self._start_command_panel_sync()
+
+    @filter.on_plugin_loaded()
+    async def on_plugin_loaded(self, metadata: Any = None) -> None:
+        """启动在 AstrBot 已运行后安装或重载的插件后台任务。"""
+        if not self.enabled:
+            return
+        self._start_forward_worker()
         self._start_command_panel_sync()
 
     async def terminate(self) -> None:
+        await self._stop_forward_worker()
+        await self._stop_auto_recall_tasks()
         await self._stop_guess_result_watch()
         await self._stop_command_panel_sync()
         await self._stop_gateway()
@@ -943,9 +1002,12 @@ class OmniBotGateway(Star):
             return web.json_response(
                 {"error": f"unknown group: {group_id}"}, status=404
             )
-        if not await self._push(session, message):
+        sent, message_id = await self._push(session, message)
+        if not sent:
             return web.json_response({"error": "send failed"}, status=500)
-        return web.json_response({"status": "ok", "data": {"message_id": 0}})
+        return web.json_response(
+            {"status": "ok", "data": {"message_id": message_id or 0}}
+        )
 
     async def _http_send_private_msg(self, request: web.Request) -> web.Response:
         if not self.enabled:
@@ -964,30 +1026,426 @@ class OmniBotGateway(Star):
         session = self._session_by_user.get(user_id)
         if session is None:
             return web.json_response({"error": f"unknown user: {user_id}"}, status=404)
-        if not await self._push(session, message):
+        sent, message_id = await self._push(session, message)
+        if not sent:
             return web.json_response({"error": "send failed"}, status=500)
-        return web.json_response({"status": "ok", "data": {"message_id": 0}})
+        return web.json_response(
+            {"status": "ok", "data": {"message_id": message_id or 0}}
+        )
 
-    async def _push(self, session: Any, message: str) -> bool:
-        chain = MessageChain()
-        chain.message(message)
+    async def _push(self, session: Any, message: str) -> tuple[bool, str]:
+        chain = MessageChain(
+            chain=[Comp.Plain(text=message)],
+            use_markdown_=False,
+        )
         try:
-            await self.context.send_message(session, chain)
-            return True
+            return await self._send_session_chain(session, chain)
         except Exception as exc:  # noqa: BLE001
             self.logger.error("主动发送消息失败：%s", type(exc).__name__)
+            return False, ""
+
+    def _find_platform_for_session(self, session: Any) -> Any | None:
+        manager = getattr(self.context, "platform_manager", None)
+        instances = getattr(manager, "platform_insts", None) or []
+        platform_id = _as_str(getattr(session, "platform_id", "")).strip()
+        fallback: list[Any] = []
+        for platform in instances:
+            try:
+                meta = platform.meta()
+                name = _as_str(getattr(meta, "name", "")).strip().lower()
+                if name not in ONEBOT_PLATFORM_NAMES | QQ_OFFICIAL_PLATFORM_NAMES:
+                    continue
+                if platform_id and _as_str(getattr(meta, "id", "")).strip() == platform_id:
+                    return platform
+                fallback.append(platform)
+            except Exception:
+                continue
+        return fallback[0] if len(fallback) == 1 else None
+
+    @staticmethod
+    def _extract_message_id(payload: Any) -> str:
+        """Extract a OneBot/QQ official message id from common response shapes."""
+        if payload is None:
+            return ""
+        if isinstance(payload, dict):
+            for key in ("message_id", "id"):
+                value = payload.get(key)
+                text = _as_str(value).strip()
+                if text and text != "0":
+                    return text
+            for key in ("data", "message"):
+                if isinstance(payload.get(key), dict):
+                    nested = OmniBotGateway._extract_message_id(payload[key])
+                    if nested:
+                        return nested
+            return ""
+        for attr in ("message_id", "id"):
+            value = getattr(payload, attr, None)
+            text = _as_str(value).strip()
+            if text and text != "0":
+                return text
+        return ""
+
+    @staticmethod
+    def _onebot_segments(chain: MessageChain) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for component in chain.chain:
+            if isinstance(component, Comp.At):
+                qq = _to_int_if_possible(getattr(component, "qq", ""))
+                result.append({"type": "at", "data": {"qq": qq}})
+            elif isinstance(component, Comp.Plain):
+                text = _as_str(getattr(component, "text", ""))
+                if text:
+                    result.append({"type": "text", "data": {"text": text}})
+            else:
+                converter = getattr(component, "toDict", None)
+                if callable(converter):
+                    segment = converter()
+                    if isinstance(segment, dict):
+                        result.append(segment)
+        return result
+
+    async def _send_onebot_chain(
+        self,
+        *,
+        bot: Any,
+        is_group: bool,
+        session_id: str,
+        chain: MessageChain,
+        self_id: Any = None,
+    ) -> str:
+        session_id = _as_str(session_id).strip()
+        if not session_id.isdigit():
+            raise ValueError(f"OneBot 会话 ID 不是数字：{session_id}")
+        messages = self._onebot_segments(chain)
+        if not messages:
+            return ""
+        routing = {"self_id": self_id} if self_id else {}
+        if is_group:
+            ret = await bot.send_group_msg(
+                group_id=int(session_id),
+                message=messages,
+                **routing,
+            )
+        else:
+            ret = await bot.send_private_msg(
+                user_id=int(session_id),
+                message=messages,
+                **routing,
+            )
+        return self._extract_message_id(ret)
+
+    def _recall_target_for_event(
+        self,
+        event: AstrMessageEvent,
+        message_id: str,
+    ) -> RecallTarget | None:
+        if not message_id:
+            return None
+        platform_name = _as_str(event.get_platform_name()).strip().lower()
+        parser = self._message_parser_for_event(event)
+        bot = getattr(event, "bot", None)
+        if parser == MESSAGE_PARSER_ONEBOT:
+            is_group = bool(event.get_group_id())
+            return RecallTarget(
+                platform_name or MESSAGE_PARSER_ONEBOT,
+                message_id,
+                _as_str(
+                    event.get_group_id() if is_group else event.get_sender_id()
+                ).strip(),
+                "group" if is_group else "private",
+                bot,
+            )
+
+        raw = getattr(event.message_obj, "raw_message", None)
+        group_openid = _as_str(
+            getattr(raw, "group_openid", "")
+            or getattr(event.message_obj, "group_id", "")
+        ).strip()
+        author = getattr(raw, "author", None)
+        user_openid = _as_str(
+            getattr(author, "user_openid", "") if author is not None else ""
+        ).strip()
+        channel_id = _as_str(getattr(raw, "channel_id", "")).strip()
+        guild_id = _as_str(getattr(raw, "guild_id", "")).strip()
+        if group_openid:
+            return RecallTarget(platform_name, message_id, group_openid, "group", bot)
+        if channel_id:
+            return RecallTarget(platform_name, message_id, channel_id, "channel", bot)
+        if guild_id:
+            return RecallTarget(platform_name, message_id, guild_id, "guild_dm", bot)
+        if user_openid:
+            return RecallTarget(platform_name, message_id, user_openid, "c2c", bot)
+        session_id = _as_str(event.get_sender_id()).strip()
+        return RecallTarget(platform_name, message_id, session_id, "c2c", bot)
+
+    def _recall_target_for_session(
+        self,
+        session: Any,
+        platform: Any,
+        message_id: str,
+    ) -> RecallTarget | None:
+        if not message_id or platform is None:
+            return None
+        try:
+            name = _as_str(platform.meta().name).strip().lower()
+        except Exception:
+            return None
+        session_id = _as_str(getattr(session, "session_id", "")).strip()
+        message_type = getattr(session, "message_type", None)
+        is_group = message_type == MessageType.GROUP_MESSAGE
+        bot = getattr(platform, "bot", None) or getattr(platform, "client", None)
+        if name in ONEBOT_PLATFORM_NAMES:
+            return RecallTarget(
+                name,
+                message_id,
+                session_id,
+                "group" if is_group else "private",
+                bot,
+            )
+
+        scene_map = getattr(platform, "_session_scene", {})
+        scene = _as_str(scene_map.get(session_id, "")).strip().lower()
+        if not scene:
+            scene = "group" if is_group else "c2c"
+        if scene == "friend":
+            scene = "c2c"
+        return RecallTarget(name, message_id, session_id, scene, bot)
+
+    @staticmethod
+    def _platform_message_cache_id(platform: Any, session_id: str) -> str:
+        cache = getattr(platform, "_session_last_message_id", None)
+        if not isinstance(cache, dict):
+            return ""
+        candidates = [session_id, session_id.rsplit("_", 1)[-1]]
+        for key in candidates:
+            value = _as_str(cache.get(key)).strip()
+            if value:
+                return value
+        return ""
+
+    async def _send_event_chain(
+        self,
+        event: AstrMessageEvent,
+        chain: MessageChain,
+    ) -> tuple[bool, str]:
+        parser = self._message_parser_for_event(event)
+        platform_name = _as_str(event.get_platform_name()).strip().lower()
+        if parser == MESSAGE_PARSER_ONEBOT:
+            is_group = bool(event.get_group_id())
+            raw = getattr(event.message_obj, "raw_message", None)
+            self_id = raw.get("self_id") if isinstance(raw, dict) else None
+            message_id = await self._send_onebot_chain(
+                bot=event.bot,
+                is_group=is_group,
+                session_id=_as_str(
+                    event.get_group_id() if is_group else event.get_sender_id()
+                ),
+                chain=chain,
+                self_id=self_id,
+            )
+            # The platform adapter's send() only forwards to OneBot and then
+            # calls this base method for bookkeeping; we already sent it above.
+            await AstrMessageEvent.send(event, chain)
+            self._schedule_message_recall(
+                self._recall_target_for_event(event, message_id)
+            )
+            return True, message_id
+
+        if (
+            platform_name in QQ_OFFICIAL_PLATFORM_NAMES
+            and hasattr(event, "_post_send")
+        ):
+            event.send_buffer = chain
+            try:
+                ret = await event._post_send()
+            finally:
+                event.send_buffer = None
+            message_id = self._extract_message_id(ret)
+            self._schedule_message_recall(
+                self._recall_target_for_event(event, message_id)
+            )
+            return True, message_id
+
+        await event.send(chain)
+        return True, ""
+
+    async def _send_session_chain(
+        self,
+        session: Any,
+        chain: MessageChain,
+    ) -> tuple[bool, str]:
+        platform = self._find_platform_for_session(session)
+        platform_name = ""
+        if platform is not None:
+            try:
+                platform_name = _as_str(platform.meta().name).strip().lower()
+            except Exception:
+                platform_name = ""
+        session_id = _as_str(getattr(session, "session_id", "")).strip()
+        if platform is not None and platform_name in ONEBOT_PLATFORM_NAMES:
+            bot = getattr(platform, "bot", None)
+            if bot is None:
+                raise RuntimeError("OneBot 平台实例缺少 bot")
+            message_id = await self._send_onebot_chain(
+                bot=bot,
+                is_group=getattr(session, "message_type", None)
+                == MessageType.GROUP_MESSAGE,
+                session_id=session_id,
+                chain=chain,
+            )
+            self._schedule_message_recall(
+                self._recall_target_for_session(session, platform, message_id)
+            )
+            return True, message_id
+
+        previous_id = (
+            self._platform_message_cache_id(platform, session_id)
+            if platform is not None
+            else ""
+        )
+        await self.context.send_message(session, chain)
+        message_id = ""
+        if platform is not None:
+            current_id = self._platform_message_cache_id(platform, session_id)
+            if current_id and current_id != previous_id:
+                message_id = current_id
+        self._schedule_message_recall(
+            self._recall_target_for_session(session, platform, message_id)
+        )
+        return True, message_id
+
+    def _schedule_message_recall(self, target: RecallTarget | None) -> None:
+        if not self.auto_recall_enabled or target is None:
+            return
+        if not target.message_id or not target.session_id:
+            return
+        if target.platform_name not in (
+            ONEBOT_PLATFORM_NAMES | QQ_OFFICIAL_PLATFORM_NAMES
+        ):
+            return
+        try:
+            task = asyncio.create_task(
+                self._recall_after_delay(target, self.auto_recall_delay_seconds),
+                name="omnibot-auto-recall",
+            )
+        except RuntimeError:
+            return
+        self._recall_tasks.add(task)
+        task.add_done_callback(self._recall_tasks.discard)
+
+    async def _recall_after_delay(
+        self,
+        target: RecallTarget,
+        delay_seconds: float,
+    ) -> None:
+        await asyncio.sleep(max(0, delay_seconds))
+        try:
+            recalled = await self._recall_message(target)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            recalled = False
+            self._warn_recall_once(
+                target,
+                f"撤回失败：{type(exc).__name__}: {exc}",
+            )
+        if recalled:
+            self.logger.info(
+                "[自动撤回] 已撤回消息：platform=%s scene=%s message_id=%s",
+                target.platform_name,
+                target.scene,
+                target.message_id,
+            )
+
+    def _warn_recall_once(self, target: RecallTarget, message: str) -> None:
+        key = f"{target.platform_name}:{target.scene}"
+        if key in self._recall_warnings:
+            return
+        self._recall_warnings.add(key)
+        self.logger.warning("[自动撤回] %s（%s/%s）", message, key, target.message_id)
+
+    async def _recall_message(self, target: RecallTarget) -> bool:
+        bot = target.bot
+        if bot is None:
+            self._warn_recall_once(target, "平台未提供可撤回的客户端实例")
             return False
+
+        if target.platform_name in ONEBOT_PLATFORM_NAMES:
+            message_id: int | str = target.message_id
+            if target.message_id.isdigit():
+                message_id = int(target.message_id)
+            await bot.call_action("delete_msg", message_id=message_id)
+            return True
+
+        if target.platform_name not in QQ_OFFICIAL_PLATFORM_NAMES:
+            return False
+
+        if target.scene == "channel":
+            await bot.api.recall_message(
+                channel_id=target.session_id,
+                message_id=target.message_id,
+            )
+            return True
+        if target.scene == "guild_dm":
+            from botpy.http import Route
+
+            route = Route(
+                "DELETE",
+                "/dms/{guild_id}/messages/{message_id}",
+                guild_id=target.session_id,
+                message_id=target.message_id,
+            )
+            await bot.api._http.request(route, params={"hidetip": "false"})
+            return True
+        if target.scene == "group":
+            path = "/v2/groups/{group_openid}/messages/{message_id}"
+            parameters = {
+                "group_openid": target.session_id,
+                "message_id": target.message_id,
+            }
+        elif target.scene == "c2c":
+            path = "/v2/users/{user_openid}/messages/{message_id}"
+            parameters = {
+                "user_openid": target.session_id,
+                "message_id": target.message_id,
+            }
+        else:
+            self._warn_recall_once(target, f"不支持的 QQ 官方会话场景：{target.scene}")
+            return False
+
+        from botpy.http import Route
+
+        route = Route("DELETE", path, **parameters)
+        await bot.api._http.request(route)
+        return True
+
+    async def _stop_auto_recall_tasks(self) -> None:
+        tasks = [task for task in self._recall_tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._recall_tasks.clear()
 
     # ------------------------------------------------------------------
     # OmniBot 指令清单 -> QQ 官方指令面板
     # ------------------------------------------------------------------
     def _start_command_panel_sync(self) -> None:
-        if (
-            not self.enabled
-            or not self.command_panel_sync_enabled
-            or not self.site_url
-            or not self.secret
-        ):
+        disabled_reasons: list[str] = []
+        if not self.enabled:
+            disabled_reasons.append("插件未启用")
+        if not self.command_panel_sync_enabled:
+            disabled_reasons.append("未开启“同步 QQ 官方指令面板”")
+        if not self.site_url:
+            disabled_reasons.append("未配置 OmniBot 站点地址")
+        if not self.secret:
+            disabled_reasons.append("未配置 QQ 安全密钥")
+        if disabled_reasons:
+            self.logger.warning(
+                "QQ 指令面板同步未启动：%s",
+                "；".join(disabled_reasons),
+            )
             return
         if self._panel_sync_task is not None and not self._panel_sync_task.done():
             return
@@ -1509,24 +1967,129 @@ class OmniBotGateway(Star):
             user_id,
         )
         payload = self._build_onebot_event(event, msg_obj, is_group, raw_message)
-        reply_text, omnibot_meta = await self._post_to_omnibot(payload)
-        self._register_guess_result_watch(omnibot_meta)
+        self._enqueue_forward(event, payload)
+
+    # ------------------------------------------------------------------
+    # 消息队列：全局单 worker 串行转发
+    # ------------------------------------------------------------------
+    def _start_forward_worker(self) -> None:
+        if (
+            not self.enabled
+            or not self.forward_to_omnibot
+            or not self.site_url
+            or not self.secret
+        ):
+            return
+        if self._forward_worker is not None and not self._forward_worker.done():
+            return
+
+        self._forward_queue = asyncio.Queue(maxsize=self.forward_queue_size)
+        self._forward_worker = asyncio.create_task(
+            self._run_forward_worker(),
+            name="omnibot-forward-worker",
+        )
+        self.logger.info(
+            "OmniBot 消息转发队列已启动：全局单 worker，队列容量=%s",
+            self.forward_queue_size,
+        )
+
+    async def _stop_forward_worker(self) -> None:
+        queue = self._forward_queue
+        self._forward_queue = None
+        task = self._forward_worker
+        self._forward_worker = None
+        if queue is not None:
+            for _ in range(queue.qsize()):
+                try:
+                    queue.get_nowait()
+                    queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    def _enqueue_forward(self, event: AstrMessageEvent, payload: dict) -> bool:
         # 一旦进入 OmniBot 转发流程，就由网关接管这条 QQ 消息。
         # 即使响应超时或鉴权失败，也不能回落到 AstrBot 的 LLM 并弹出模型错误。
         if self.stop_event_after_forward:
             event.stop_event()
+
+        queue = self._forward_queue
+        if queue is None:
+            self.logger.warning(
+                "OmniBot 转发队列未启动，丢弃消息：group=%s user=%s",
+                payload.get("group_id", "") or payload.get("group_openid", ""),
+                payload.get("user_id", ""),
+            )
+            return False
+
+        # 队列已满时丢弃最旧的队首消息，保证始终优先响应最新指令。
+        if queue.full():
+            try:
+                dropped_event, _ = queue.get_nowait()
+                queue.task_done()
+                if self.stop_event_after_forward:
+                    dropped_event.stop_event()
+            except asyncio.QueueEmpty:
+                pass
+            self.logger.warning(
+                "OmniBot 转发队列已满（容量=%s），丢弃队首旧消息并接入最新消息。",
+                self.forward_queue_size,
+            )
+
+        try:
+            queue.put_nowait((event, payload))
+        except asyncio.QueueFull:  # 理论不可达，防御性兜底。
+            self.logger.error(
+                "OmniBot 转发队列再次已满，丢弃最新消息：user=%s",
+                payload.get("user_id", ""),
+            )
+            event.stop_event()
+            return False
+        return True
+
+    async def _run_forward_worker(self) -> None:
+        queue = self._forward_queue
+        if queue is None:
+            return
+        try:
+            while True:
+                event, payload = await queue.get()
+                try:
+                    await self._process_forward_item(event, payload)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.error("处理 OmniBot 转发消息失败：%s", exc)
+                finally:
+                    queue.task_done()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._forward_worker = None
+
+    async def _process_forward_item(
+        self, event: AstrMessageEvent, payload: dict
+    ) -> None:
+        reply_text, omnibot_meta = await self._post_to_omnibot(payload)
+        self._register_guess_result_watch(omnibot_meta)
         if reply_text is None:
             return
         self.logger.info(
             "OmniBot webhook 成功：type=%s group=%s user=%s has_reply=%s",
-            "group" if is_group else "private",
-            group_id or "-",
-            user_id,
+            payload.get("message_type", "-"),
+            payload.get("group_id", "") or payload.get("group_openid", "-"),
+            payload.get("user_id", "-"),
             bool(reply_text),
         )
-
         if reply_text:
-            await self._send_reply(event, reply_text, is_group, user_id)
+            await self._send_reply(
+                event,
+                reply_text,
+                payload.get("message_type", "") == "group",
+                str(payload.get("user_id", "") or ""),
+            )
 
     def _print_incoming(
         self,
@@ -2112,7 +2675,7 @@ class OmniBotGateway(Star):
                     ],
                     use_markdown_=True,
                 )
-                await self.context.send_message(session, chain)
+                await self._send_session_chain(session, chain)
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning(
                     "猜大小开奖 Markdown 发送失败，改用纯文本：%s", exc
@@ -2122,7 +2685,7 @@ class OmniBotGateway(Star):
                         chain=[Comp.Plain(text=message)],
                         use_markdown_=False,
                     )
-                    await self.context.send_message(session, plain_chain)
+                    await self._send_session_chain(session, plain_chain)
                 except Exception as fallback_exc:  # noqa: BLE001
                     return (
                         False,
@@ -2239,17 +2802,45 @@ class OmniBotGateway(Star):
         is_group: bool,
         user_id: str,
     ) -> None:
+        parser = self._message_parser_for_event(event)
+        is_qq_official = parser == MESSAGE_PARSER_QQ_OFFICIAL
+        sender_name = ""
+        if is_group and is_qq_official:
+            try:
+                sender_name = _as_str(event.get_sender_name()).strip()
+            except Exception:
+                sender_name = ""
+            if not sender_name:
+                sender = getattr(event.message_obj, "sender", None)
+                sender_name = _as_str(getattr(sender, "name", "")).strip()
+
         prefix = self.reply_prefix.strip()
-        text = f"{prefix}{reply_text}" if prefix else reply_text
+        sender_label = ""
+        if sender_name:
+            sender_name = _truncate_qq_text(
+                re.sub(r"[\r\n]+", " ", sender_name),
+                32,
+            )
+            sender_label = f"@{sender_name}\n" if sender_name else ""
+        text = f"{prefix}{sender_label}{reply_text}" if prefix else (
+            f"{sender_label}{reply_text}" if sender_label else reply_text
+        )
+
         chain: list = []
         is_onebot = self._is_onebot_event(event)
         if is_group and user_id and is_onebot:
             chain.append(Comp.At(qq=_to_int_if_possible(user_id)))
+        elif is_qq_official:
+            message_id = _as_str(getattr(event.message_obj, "message_id", "")).strip()
+            if message_id:
+                # QQ 官方群/C2C 不支持普通用户的 At 组件，但支持用
+                # message_reference 引用当前入站消息。AstrBot 会把非
+                # REFIDX_ 的 Reply.id 回退为当前消息的 msg_idx。
+                chain.append(Comp.Reply(id=message_id))
 
         # 只有支持 markdown 的平台才重排；其余平台保持 OmniBot 原文，
         # 避免把 `##`、`|` 这类语法原样发给不渲染 markdown 的客户端。
         platform_name = event.get_platform_name()
-        parser = self._message_parser_for_event(event)
         markdown_platforms = self.reply_markdown_platforms
         use_markdown = (
             self.reply_markdown_enabled
@@ -2277,11 +2868,12 @@ class OmniBotGateway(Star):
         try:
             # 直接发送 markdown 文本，不再转图。
             # AstrBot 在平台明确拒绝 markdown 时会自动回退为纯文本 content。
-            await event.send(
+            await self._send_event_chain(
+                event,
                 MessageChain(
                     chain=chain,
                     use_markdown_=use_markdown,
-                )
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             if not use_markdown:
@@ -2295,9 +2887,18 @@ class OmniBotGateway(Star):
             fallback: list = []
             if is_group and user_id and is_onebot:
                 fallback.append(Comp.At(qq=_to_int_if_possible(user_id)))
+            elif is_qq_official:
+                message_id = _as_str(
+                    getattr(event.message_obj, "message_id", "")
+                ).strip()
+                if message_id:
+                    fallback.append(Comp.Reply(id=message_id))
             fallback.append(Comp.Plain(text=text))
             try:
-                await event.send(MessageChain(chain=fallback, use_markdown_=False))
+                await self._send_event_chain(
+                    event,
+                    MessageChain(chain=fallback, use_markdown_=False),
+                )
             except Exception as fallback_exc:  # noqa: BLE001
                 self.logger.error("代发 OmniBot 回复失败：%s", fallback_exc)
 

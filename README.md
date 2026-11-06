@@ -29,6 +29,17 @@
 `stop_event_after_forward=true`，插件会接管 QQ 消息；即使 OmniBot 超时或鉴权失败，
 也不会回落到 AstrBot 的 LLM 并弹出“未找到任何可用对话模型”。
 
+人一多时，所有 QQ 消息会先进入全局队列，由单个后台 worker 串行转发给 OmniBot
+（严格不并行），避免同时对服务器发起大量请求导致卡顿。队列默认长度 200，塞满时
+丢弃排队最旧的旧消息、优先响应最新指令；串行意味着排在队尾的消息其回复会有延迟。
+
+插件默认会把自己发送的回复和主动通知在 15 秒后撤回，避免指令结果长期刷屏。
+QQ 官方机器人群聊回复会引用触发消息，并在正文前显示发送人昵称；官方平台
+不支持普通用户的真实 At 组件，因此昵称前缀用于补充识别。
+OneBot（NapCat、LLOneBot、Lagrange）使用发送接口返回的真实 `message_id` 调用
+`delete_msg`；QQ 官方机器人使用群聊/C2C 撤回接口。只处理本插件刚发出的消息，
+不会撤回用户消息或其他插件消息。
+
 只有需要站内信、后台通知等无入站触发场景时，才开启
 `outbound_gateway_enabled`。此时插件通过 aiohttp 单独监听端口，默认 `8080`，
 与 OmniBot `qq_bot_api_base` 的默认值一致。没有使用 AstrBot 的 Dashboard
@@ -117,9 +128,12 @@ astrbot_plugin_omnibot/
 | `command_panel_max_items` | `20` | QQ 面板最多展示的指令数量 |
 | `forward_private` | `true` | 是否转发私聊 |
 | `request_timeout` | `10` | 请求 OmniBot 的超时秒数 |
+| `forward_queue_size` | `200` | 全局消息队列长度：所有群/私聊消息由单个 worker 串行转发，避免并发刷爆服务器；队列满时丢弃最旧消息 |
 | `stop_event_after_forward` | `true` | 进入转发流程后阻止 AstrBot 的 AI/其他插件处理，失败时也不回落到大模型 |
 | `reply_from_webhook_json` | `true` | 直接代发响应里的 `reply` |
 | `reply_prefix` | 空 | 代发回复统一前缀 |
+| `auto_recall_enabled` | `true` | 仅撤回本插件刚发送的消息 |
+| `auto_recall_delay_seconds` | `15` | 发送成功后多少秒撤回，允许 5 到 120 秒 |
 | `reply_markdown_enabled` | `true` | 把 OmniBot 纯文本模板重排为 Markdown（标题、表格、列表） |
 | `reply_markdown_platforms` | `["qq_official"]` | 启用 Markdown 的平台；QQ 官方可直接渲染，OneBot 等客户端通常不渲染 |
 | `reply_markdown_max_rows` | `40` | 表格/列表最多渲染行数，超出显示省略说明 |
@@ -187,6 +201,8 @@ OmniBot 的回复模板是 `────` 分隔线 + `键：值` 的纯文本�
   "request_timeout": 10,
   "stop_event_after_forward": true,
   "reply_from_webhook_json": true,
+  "auto_recall_enabled": true,
+  "auto_recall_delay_seconds": 15,
   "reply_prefix": ""
 }
 ```
